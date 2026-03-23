@@ -1,0 +1,62 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile for authentication and role-based access.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "staff"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role"]
+    },
+    "Customer": {
+      "title": "Customer",
+      "description": "Land customer details.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "phone": { "type": "string" },
+        "address": { "type": "string" },
+        "validityDate": { "type": "string", "format": "date-time", "description": "Subscription expiry date" },
+        "balance": { "type": "number" },
+        "status": { "type": "string", "enum": ["active", "expired"] },
+        "createdBy": { "type": "string", "description": "UID of the user who added this customer" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "phone", "validityDate"]
+    },
+    "Collection": {
+      "title": "Collection",
+      "description": "Payment collection records.",
+      "type": "object",
+      "properties": {
+        "customerId": { "type": "string" },
+        "customerName": { "type": "string" },
+        "amount": { "type": "number" },
+        "date": { "type": "string", "format": "date-time" },
+        "previousValidity": { "type": "string", "format": "date-time" },
+        "newValidity": { "type": "string", "format": "date-time" },
+        "collectedBy": { "type": "string", "description": "UID of the user who collected the payment" }
+      },
+      "required": ["customerId", "amount", "date"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles"
+    },
+    "/customers/{customerId}": {
+      "schema": "Customer",
+      "description": "Customer records"
+    },
+    "/collections/{collectionId}": {
+      "schema": "Collection",
+      "description": "Collection records"
+    }
+  }
+}

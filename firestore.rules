@@ -1,0 +1,130 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: userId (Auth UID)
+    // Fields:
+    //   - uid: string (required)
+    //   - email: string (required, format: email)
+    //   - displayName: string (optional)
+    //   - role: string (required, enum: ['admin', 'staff'])
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: customers
+    // Document ID: customerId
+    // Fields:
+    //   - name: string (required)
+    //   - phone: string (required)
+    //   - address: string (optional)
+    //   - validityDate: timestamp (required)
+    //   - balance: number (optional)
+    //   - status: string (required, enum: ['active', 'expired'])
+    //   - createdBy: string (required, UID)
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: collections
+    // Document ID: collectionId
+    // Fields:
+    //   - customerId: string (required)
+    //   - customerName: string (required)
+    //   - amount: number (required)
+    //   - date: timestamp (required)
+    //   - previousValidity: timestamp (required)
+    //   - newValidity: timestamp (required)
+    //   - collectedBy: string (required, UID)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "sflove087@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    function isValidUser(data, userId) {
+      return hasOnlyAllowedFields(['uid', 'email', 'displayName', 'role', 'createdAt']) &&
+             data.uid == userId &&
+             isValidEmail(data.email) &&
+             data.role in ['admin', 'staff'] &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidCustomer(data) {
+      return hasOnlyAllowedFields(['name', 'phone', 'address', 'validityDate', 'balance', 'status', 'createdBy', 'createdAt']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             data.phone is string && data.phone.size() > 0 && data.phone.size() < 20 &&
+             data.validityDate is timestamp &&
+             data.status in ['active', 'expired'] &&
+             data.createdBy == request.auth.uid &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidCollection(data) {
+      return hasOnlyAllowedFields(['customerId', 'customerName', 'amount', 'date', 'previousValidity', 'newValidity', 'collectedBy']) &&
+             data.customerId is string &&
+             data.customerName is string &&
+             data.amount is number && data.amount >= 0 &&
+             data.date is timestamp &&
+             data.previousValidity is timestamp &&
+             data.newValidity is timestamp &&
+             data.collectedBy == request.auth.uid;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (isOwner(userId) || isAdmin());
+      allow create: if isAuthenticated() && isOwner(userId) && isValidUser(request.resource.data, userId) && (request.resource.data.role == 'staff' || isAdmin());
+      allow update: if isAuthenticated() && (
+        (isOwner(userId) && isValidUser(request.resource.data, userId) && (request.resource.data.role == resource.data.role || isAdmin())) ||
+        (isAdmin() && isValidUser(request.resource.data, userId))
+      );
+      allow delete: if isAdmin();
+    }
+
+    match /customers/{customerId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidCustomer(request.resource.data);
+      allow update: if isAuthenticated() && isValidCustomer(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /collections/{collectionId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidCollection(request.resource.data);
+      allow update: if isAdmin(); // Only admins can correct collection records
+      allow delete: if isAdmin();
+    }
+  }
+}
