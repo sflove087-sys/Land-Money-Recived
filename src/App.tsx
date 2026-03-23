@@ -217,8 +217,13 @@ export default function App() {
     const provider = new GoogleAuthProvider();
     try {
       await signInWithPopup(auth, provider);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Login failed", error);
+      if (error.code === 'auth/unauthorized-domain') {
+        alert("এই ডোমেইনটি Firebase-এ অনুমোদিত নয়। দয়া করে Firebase Console-এ গিয়ে Authorized Domains-এ এই ডোমেইনটি যুক্ত করুন।");
+      } else {
+        alert("লগইন ব্যর্থ হয়েছে: " + (error.message || "অজানা সমস্যা"));
+      }
     }
   };
 
