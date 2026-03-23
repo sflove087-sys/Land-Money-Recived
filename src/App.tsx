@@ -37,8 +37,19 @@ import {
   GoogleAuthProvider, 
   onAuthStateChanged, 
   signOut,
-  User as FirebaseUser
+  User as FirebaseUser,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signInWithPhoneNumber,
+  RecaptchaVerifier,
+  ConfirmationResult
 } from 'firebase/auth';
+import { 
+  Mail,
+  Lock,
+  Smartphone,
+  ArrowRight
+} from 'lucide-react';
 import { 
   collection, 
   onSnapshot, 
@@ -50,7 +61,7 @@ import {
 import { format, addMonths, isAfter, isBefore, startOfDay, endOfDay, differenceInDays } from 'date-fns';
 import { bn } from 'date-fns/locale';
 
-import { auth, db } from './firebase';
+import { auth, db, handleFirestoreError, OperationType } from './firebase';
 import { dataService } from './services/dataService';
 import { Customer, CollectionRecord, UserProfile } from './types';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -122,6 +133,16 @@ export default function App() {
   const [googleTokens, setGoogleTokens] = useState<any>(null);
   const [spreadsheetId, setSpreadsheetId] = useState<string | null>(localStorage.getItem('gsheet_id'));
 
+  // Auth UI State
+  const [loginMode, setLoginMode] = useState<'google' | 'email' | 'phone'>('google');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [otp, setOtp] = useState('');
+  const [isOtpSent, setIsOtpSent] = useState(false);
+  const [confirmationResult, setConfirmationResult] = useState<ConfirmationResult | null>(null);
+  const [isSignUp, setIsSignUp] = useState(false);
+
   // Data State
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
@@ -139,7 +160,8 @@ export default function App() {
     phone: '',
     address: '',
     validityMonths: 1,
-    balance: 0
+    balance: 0,
+    startDate: format(new Date(), 'yyyy-MM-dd')
   });
 
   const [collectionForm, setCollectionForm] = useState({
@@ -227,6 +249,148 @@ export default function App() {
     }
   };
 
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+    try {
+      if (isSignUp) {
+        await createUserWithEmailAndPassword(auth, email, password);
+      } else {
+        await signInWithEmailAndPassword(auth, email, password);
+      }
+    } catch (error: any) {
+      console.error("Email auth failed", error);
+      alert("অথেন্টিকেশন ব্যর্থ হয়েছে: " + (error.message || "অজানা সমস্যা"));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const setupRecaptcha = () => {
+    try {
+      if (!(window as any).recaptchaVerifier) {
+        const container = document.getElementById('recaptcha-container');
+        if (!container) return;
+
+        (window as any).recaptchaVerifier = new RecaptchaVerifier(auth, 'recaptcha-container', {
+          'size': 'invisible',
+          'callback': () => {
+            console.log("Recaptcha verified");
+          },
+          'expired-callback': () => {
+            console.log("Recaptcha expired");
+            if ((window as any).recaptchaVerifier) {
+              (window as any).recaptchaVerifier.clear();
+              (window as any).recaptchaVerifier = null;
+            }
+          }
+        });
+      }
+    } catch (error) {
+      console.error("Recaptcha setup error", error);
+      if ((window as any).recaptchaVerifier) {
+        try { (window as any).recaptchaVerifier.clear(); } catch(e) {}
+        (window as any).recaptchaVerifier = null;
+      }
+    }
+  };
+
+  useEffect(() => {
+    // Setup recaptcha when in phone login mode and container is available
+    if (loginMode === 'phone' && !isOtpSent && !user) {
+      // Small delay to ensure DOM is ready
+      const timer = setTimeout(() => {
+        setupRecaptcha();
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [loginMode, isOtpSent, user]);
+
+  useEffect(() => {
+    // Clear recaptcha when switching away from phone mode or OTP is sent
+    if ((loginMode !== 'phone' || isOtpSent || user) && (window as any).recaptchaVerifier) {
+      try {
+        (window as any).recaptchaVerifier.clear();
+      } catch (e) {
+        console.error("Error clearing recaptcha", e);
+      }
+      (window as any).recaptchaVerifier = null;
+    }
+  }, [loginMode, isOtpSent, user]);
+
+  const handlePhoneLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+    try {
+      // Strip all non-digit characters except '+'
+      let formattedPhone = phoneNumber.trim().replace(/[^\d+]/g, '');
+      
+      // Basic E.164 formatting for common BD inputs
+      if (!formattedPhone.startsWith('+')) {
+        if (formattedPhone.startsWith('0')) {
+          formattedPhone = '+88' + formattedPhone;
+        } else if (formattedPhone.length === 10) {
+          // Case for 1XXXXXXXXX
+          formattedPhone = '+880' + formattedPhone;
+        } else {
+          // Fallback, just add +
+          formattedPhone = '+' + formattedPhone;
+        }
+      }
+      
+      setupRecaptcha();
+      const appVerifier = (window as any).recaptchaVerifier;
+      if (!appVerifier) throw new Error("reCAPTCHA লোড হতে ব্যর্থ হয়েছে। দয়া করে পেজটি রিফ্রেশ করুন।");
+      
+      const result = await signInWithPhoneNumber(auth, formattedPhone, appVerifier);
+      setConfirmationResult(result);
+      setIsOtpSent(true);
+    } catch (error: any) {
+      console.error("Phone login failed", error);
+      
+      let errorMessage = "ফোন লগইন ব্যর্থ হয়েছে: " + (error.message || "অজানা সমস্যা");
+      
+      if (error.code === 'auth/billing-not-enabled') {
+        errorMessage = "Firebase Phone Authentication-এর জন্য আপনার Firebase প্রজেক্টে Billing (Blaze Plan) চালু করা প্রয়োজন। দয়া করে Firebase Console-এ গিয়ে এটি চেক করুন।";
+      } else if (error.code === 'auth/operation-not-allowed') {
+        errorMessage = "SMS সার্ভিসটি আপনার Firebase প্রজেক্টে চালু করা নেই। দয়া করে Authentication > Sign-in method-এ গিয়ে Phone চালু করুন।";
+      }
+      
+      alert(errorMessage);
+      
+      // Reset reCAPTCHA if it fails
+      if ((window as any).recaptchaVerifier) {
+        try { (window as any).recaptchaVerifier.clear(); } catch(e) {}
+        (window as any).recaptchaVerifier = null;
+      }
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!confirmationResult) return;
+    setIsSubmitting(true);
+    try {
+      await confirmationResult.confirm(otp);
+    } catch (error: any) {
+      console.error("OTP verification failed", error);
+      alert("OTP ভেরিফিকেশন ব্যর্থ হয়েছে: " + (error.message || "অজানা সমস্যা"));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if ((window as any).recaptchaVerifier) {
+        try { (window as any).recaptchaVerifier.clear(); } catch(e) {}
+        (window as any).recaptchaVerifier = null;
+      }
+    };
+  }, []);
+
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       if (event.data?.type === 'GOOGLE_AUTH_SUCCESS') {
@@ -290,34 +454,58 @@ export default function App() {
     }
   };
 
-  // --- Data Fetching ---
+    // --- Data Fetching ---
   useEffect(() => {
-    if (!user) return;
+    if (!user || !userProfile) return;
 
-    const qCustomers = query(collection(db, 'customers'), orderBy('createdAt', 'desc'));
+    let qCustomers;
+    if (userProfile.role === 'admin') {
+      qCustomers = query(collection(db, 'customers'), orderBy('createdAt', 'desc'));
+    } else {
+      qCustomers = query(
+        collection(db, 'customers'), 
+        where('createdBy', '==', user.uid),
+        orderBy('createdAt', 'desc')
+      );
+    }
+
     const unsubCustomers = onSnapshot(qCustomers, (snapshot) => {
       const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Customer));
       setCustomers(docs);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, 'customers');
     });
 
-    const qCollections = query(collection(db, 'collections'), orderBy('date', 'desc'));
+    let qCollections;
+    if (userProfile.role === 'admin') {
+      qCollections = query(collection(db, 'collections'), orderBy('date', 'desc'));
+    } else {
+      qCollections = query(
+        collection(db, 'collections'), 
+        where('collectedBy', '==', user.uid),
+        orderBy('date', 'desc')
+      );
+    }
+
     const unsubCollections = onSnapshot(qCollections, (snapshot) => {
       const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as CollectionRecord));
       setCollections(docs);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, 'collections');
     });
 
     return () => {
       unsubCustomers();
       unsubCollections();
     };
-  }, [user]);
+  }, [user, userProfile]);
 
   // --- Handlers ---
   const handleAddCustomer = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
     try {
-      const validityDate = addMonths(new Date(), newCustomer.validityMonths);
+      const validityDate = addMonths(new Date(newCustomer.startDate), newCustomer.validityMonths);
       
       await dataService.addCustomer({
         name: newCustomer.name,
@@ -328,7 +516,14 @@ export default function App() {
         status: 'active'
       });
 
-      setNewCustomer({ name: '', phone: '', address: '', validityMonths: 1, balance: 0 });
+      setNewCustomer({ 
+        name: '', 
+        phone: '', 
+        address: '', 
+        validityMonths: 1, 
+        balance: 0,
+        startDate: format(new Date(), 'yyyy-MM-dd')
+      });
       setActiveTab('all-customers');
     } finally {
       setIsSubmitting(false);
@@ -442,20 +637,159 @@ export default function App() {
         <motion.div 
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
-          className="bg-white p-8 rounded-3xl shadow-xl max-w-md w-full text-center border border-gray-100"
+          className="bg-white p-10 rounded-[3rem] shadow-2xl max-w-md w-full text-center border border-gray-100"
         >
-          <div className="w-16 h-16 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-lg shadow-blue-200">
-            <LayoutDashboard size={32} className="text-white" />
+          <div className="w-20 h-20 bg-slate-900 rounded-[2rem] flex items-center justify-center mx-auto mb-8 shadow-2xl shadow-slate-200">
+            <LayoutDashboard size={40} className="text-white" />
           </div>
-          <h1 className="text-3xl font-bold text-gray-900 mb-2">ল্যান্ড ম্যানেজমেন্ট</h1>
-          <p className="text-gray-500 mb-8">আপনার ব্যবসার হিসাব সহজ করুন। লগইন করে শুরু করুন।</p>
-          <button
-            onClick={handleLogin}
-            className="w-full flex items-center justify-center space-x-3 bg-white border-2 border-gray-100 py-4 rounded-2xl font-semibold text-gray-700 hover:bg-gray-50 hover:border-blue-200 transition-all duration-200"
-          >
-            <img src="https://www.google.com/favicon.ico" alt="Google" className="w-5 h-5" />
-            <span>গুগল দিয়ে লগইন করুন</span>
-          </button>
+          <h1 className="text-4xl font-black text-slate-900 mb-3 tracking-tight">LAND<span className="text-slate-400 font-light">PRO</span></h1>
+          <p className="text-slate-500 mb-10 font-medium">আপনার ব্যবসার হিসাব সহজ করুন।</p>
+
+          <div className="flex p-1 bg-slate-100 rounded-2xl mb-8">
+            <button 
+              onClick={() => setLoginMode('google')}
+              className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${loginMode === 'google' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              Google
+            </button>
+            <button 
+              onClick={() => setLoginMode('email')}
+              className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${loginMode === 'email' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              Email
+            </button>
+            <button 
+              onClick={() => setLoginMode('phone')}
+              className={`flex-1 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${loginMode === 'phone' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-400 hover:text-slate-600'}`}
+            >
+              Phone
+            </button>
+          </div>
+
+          {loginMode === 'google' && (
+            <button
+              onClick={handleLogin}
+              className="w-full flex items-center justify-center space-x-4 bg-white border-2 border-slate-100 py-5 rounded-3xl font-black text-xs uppercase tracking-[0.2em] text-slate-700 hover:bg-slate-50 hover:border-slate-900 transition-all duration-300 shadow-sm active:scale-[0.98]"
+            >
+              <img src="https://www.google.com/favicon.ico" alt="Google" className="w-5 h-5" />
+              <span>গুগল দিয়ে লগইন করুন</span>
+            </button>
+          )}
+
+          {loginMode === 'email' && (
+            <form onSubmit={handleEmailAuth} className="space-y-4 text-left">
+              <div className="space-y-2">
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">ইমেইল</label>
+                <div className="relative group">
+                  <Mail className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors" size={18} />
+                  <input 
+                    type="email" 
+                    required
+                    value={email}
+                    onChange={e => setEmail(e.target.value)}
+                    placeholder="example@mail.com"
+                    className="w-full pl-14 pr-6 py-4 rounded-2xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-medium"
+                  />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">পাসওয়ার্ড</label>
+                <div className="relative group">
+                  <Lock className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors" size={18} />
+                  <input 
+                    type="password" 
+                    required
+                    value={password}
+                    onChange={e => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full pl-14 pr-6 py-4 rounded-2xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-medium"
+                  />
+                </div>
+              </div>
+              <button 
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full bg-slate-900 text-white py-5 rounded-3xl font-black text-xs uppercase tracking-[0.3em] hover:bg-slate-800 transition-all shadow-xl shadow-slate-200 flex items-center justify-center space-x-2 active:scale-[0.98]"
+              >
+                <span>{isSignUp ? 'সাইন আপ করুন' : 'লগইন করুন'}</span>
+                <ArrowRight size={16} />
+              </button>
+              <p className="text-center text-xs text-slate-400 font-medium">
+                {isSignUp ? 'ইতিমধ্যে অ্যাকাউন্ট আছে?' : 'অ্যাকাউন্ট নেই?'} 
+                <button 
+                  type="button"
+                  onClick={() => setIsSignUp(!isSignUp)}
+                  className="ml-2 text-slate-900 font-black underline"
+                >
+                  {isSignUp ? 'লগইন করুন' : 'সাইন আপ করুন'}
+                </button>
+              </p>
+            </form>
+          )}
+
+          {loginMode === 'phone' && (
+            <div className="space-y-4 text-left">
+              {!isOtpSent ? (
+                <form onSubmit={handlePhoneLogin} className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">ফোন নম্বর</label>
+                    <div className="relative group">
+                      <Smartphone className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors" size={18} />
+                      <input 
+                        type="tel" 
+                        required
+                        value={phoneNumber}
+                        onChange={e => setPhoneNumber(e.target.value)}
+                        placeholder="+8801XXXXXXXXX"
+                        className="w-full pl-14 pr-6 py-4 rounded-2xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-medium"
+                      />
+                    </div>
+                  </div>
+                  <div id="recaptcha-container"></div>
+                  <button 
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="w-full bg-slate-900 text-white py-5 rounded-3xl font-black text-xs uppercase tracking-[0.3em] hover:bg-slate-800 transition-all shadow-xl shadow-slate-200 flex items-center justify-center space-x-2 active:scale-[0.98]"
+                  >
+                    <span>OTP পাঠান</span>
+                    <ArrowRight size={16} />
+                  </button>
+                </form>
+              ) : (
+                <form onSubmit={handleVerifyOtp} className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest ml-1">OTP কোড</label>
+                    <div className="relative group">
+                      <Smartphone className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors" size={18} />
+                      <input 
+                        type="text" 
+                        required
+                        value={otp}
+                        onChange={e => setOtp(e.target.value)}
+                        placeholder="123456"
+                        className="w-full pl-14 pr-6 py-4 rounded-2xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-medium text-center tracking-[0.5em] text-xl"
+                      />
+                    </div>
+                  </div>
+                  <button 
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="w-full bg-slate-900 text-white py-5 rounded-3xl font-black text-xs uppercase tracking-[0.3em] hover:bg-slate-800 transition-all shadow-xl shadow-slate-200 flex items-center justify-center space-x-2 active:scale-[0.98]"
+                  >
+                    <span>ভেরিফাই করুন</span>
+                    <ArrowRight size={16} />
+                  </button>
+                  <button 
+                    type="button"
+                    onClick={() => setIsOtpSent(false)}
+                    className="w-full text-center text-xs text-slate-400 font-bold uppercase tracking-widest hover:text-slate-900 transition-colors"
+                  >
+                    নম্বর পরিবর্তন করুন
+                  </button>
+                </form>
+              )}
+            </div>
+          )}
         </motion.div>
       </div>
     );
@@ -494,9 +828,15 @@ export default function App() {
 
             <div className="mt-auto pt-8 border-t border-slate-100">
               <div className="flex items-center space-x-4 mb-6 p-2 rounded-2xl bg-slate-50 border border-slate-100">
-                <img src={user.photoURL || ''} alt="User" className="w-10 h-10 rounded-xl border-2 border-white shadow-sm" />
+                {user.photoURL ? (
+                  <img src={user.photoURL} alt="User" className="w-10 h-10 rounded-xl border-2 border-white shadow-sm" />
+                ) : (
+                  <div className="w-10 h-10 rounded-xl border-2 border-white shadow-sm bg-slate-200 flex items-center justify-center text-slate-500 font-bold">
+                    {(user.displayName || user.email || user.phoneNumber || '?').charAt(0).toUpperCase()}
+                  </div>
+                )}
                 <div className="overflow-hidden">
-                  <p className="text-sm font-bold text-slate-900 truncate">{user.displayName}</p>
+                  <p className="text-sm font-bold text-slate-900 truncate">{user.displayName || user.email || user.phoneNumber}</p>
                   <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">{userProfile?.role === 'admin' ? 'অ্যাডমিন' : 'স্টাফ'}</p>
                 </div>
               </div>
@@ -666,110 +1006,178 @@ export default function App() {
 
               {activeTab === 'add-customer' && (
                 <motion.div key="add-customer" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}>
-                  <div className="max-w-3xl mx-auto">
-                    <div className="mb-10 text-center">
-                      <div className="w-20 h-20 bg-slate-900 text-white rounded-[2.5rem] flex items-center justify-center mx-auto mb-6 shadow-2xl shadow-slate-200 rotate-3 hover:rotate-0 transition-transform duration-500">
-                        <UserPlus size={36} />
-                      </div>
+                  <div className="max-w-4xl mx-auto">
+                    <div className="mb-12 text-center">
+                      <motion.div 
+                        initial={{ scale: 0.5, opacity: 0 }}
+                        animate={{ scale: 1, opacity: 1 }}
+                        transition={{ type: "spring", stiffness: 260, damping: 20 }}
+                        className="w-24 h-24 bg-slate-900 text-white rounded-[2.5rem] flex items-center justify-center mx-auto mb-6 shadow-2xl shadow-slate-200 rotate-3 hover:rotate-0 transition-transform duration-500"
+                      >
+                        <UserPlus size={40} />
+                      </motion.div>
                       <h2 className="text-4xl font-black text-slate-900 mb-3 tracking-tight">নতুন গ্রাহক যুক্ত করুন</h2>
                       <p className="text-slate-500 font-medium">সঠিক তথ্য দিয়ে ডিজিটাল রেজিস্টারে গ্রাহক নথিভুক্ত করুন।</p>
                     </div>
 
-                    <form onSubmit={handleAddCustomer} className="bg-white p-10 rounded-[3.5rem] shadow-2xl shadow-slate-100 border border-slate-100 space-y-8 relative overflow-hidden">
-                      <div className="absolute top-0 right-0 w-40 h-40 bg-slate-50 rounded-full -mr-20 -mt-20 z-0" />
-                      
-                      <div className="relative z-10 space-y-8">
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                          <div className="space-y-3">
-                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">গ্রাহকের নাম</label>
-                            <div className="relative group">
-                              <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
-                                <Users size={20} />
+                    <form onSubmit={handleAddCustomer} className="space-y-8">
+                      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                        {/* Section 1: Personal Info */}
+                        <div className="lg:col-span-2 space-y-8">
+                          <div className="bg-white p-10 rounded-[3.5rem] shadow-2xl shadow-slate-100 border border-slate-100 space-y-8 relative overflow-hidden">
+                            <div className="absolute top-0 right-0 w-32 h-32 bg-slate-50 rounded-full -mr-16 -mt-16 z-0" />
+                            
+                            <div className="relative z-10">
+                              <div className="flex items-center space-x-3 mb-8">
+                                <div className="w-8 h-8 bg-indigo-100 text-indigo-600 rounded-xl flex items-center justify-center">
+                                  <Shield size={16} />
+                                </div>
+                                <h3 className="text-xs font-black text-slate-900 uppercase tracking-widest">ব্যক্তিগত তথ্য</h3>
                               </div>
-                              <input
-                                required
-                                type="text"
-                                value={newCustomer.name}
-                                onChange={e => setNewCustomer({ ...newCustomer, name: e.target.value })}
-                                className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 placeholder:text-slate-300 placeholder:font-medium text-lg"
-                                placeholder="যেমন: মোঃ রহিম আলী"
-                              />
-                            </div>
-                          </div>
-                          <div className="space-y-3">
-                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">ফোন নম্বর</label>
-                            <div className="relative group">
-                              <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
-                                <Phone size={20} />
+
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                                <div className="space-y-3">
+                                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">গ্রাহকের নাম</label>
+                                  <div className="relative group">
+                                    <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
+                                      <Users size={20} />
+                                    </div>
+                                    <input
+                                      required
+                                      type="text"
+                                      value={newCustomer.name}
+                                      onChange={e => setNewCustomer({ ...newCustomer, name: e.target.value })}
+                                      className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 placeholder:text-slate-300 placeholder:font-medium text-lg"
+                                      placeholder="যেমন: মোঃ রহিম আলী"
+                                    />
+                                  </div>
+                                </div>
+                                <div className="space-y-3">
+                                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">ফোন নম্বর</label>
+                                  <div className="relative group">
+                                    <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
+                                      <Phone size={20} />
+                                    </div>
+                                    <input
+                                      required
+                                      type="tel"
+                                      value={newCustomer.phone}
+                                      onChange={e => setNewCustomer({ ...newCustomer, phone: e.target.value })}
+                                      className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 placeholder:text-slate-300 placeholder:font-medium text-lg"
+                                      placeholder="০১XXXXXXXXX"
+                                    />
+                                  </div>
+                                </div>
                               </div>
-                              <input
-                                required
-                                type="tel"
-                                value={newCustomer.phone}
-                                onChange={e => setNewCustomer({ ...newCustomer, phone: e.target.value })}
-                                className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 placeholder:text-slate-300 placeholder:font-medium text-lg"
-                                placeholder="০১XXXXXXXXX"
-                              />
+
+                              <div className="mt-8 space-y-3">
+                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">ঠিকানা (ঐচ্ছিক)</label>
+                                <div className="relative group">
+                                  <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
+                                    <MapPin size={20} />
+                                  </div>
+                                  <input
+                                    type="text"
+                                    value={newCustomer.address}
+                                    onChange={e => setNewCustomer({ ...newCustomer, address: e.target.value })}
+                                    className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 placeholder:text-slate-300 placeholder:font-medium text-lg"
+                                    placeholder="গ্রাম, পোস্ট, উপজেলা..."
+                                  />
+                                </div>
+                              </div>
                             </div>
                           </div>
                         </div>
 
-                        <div className="space-y-3">
-                          <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">ঠিকানা (ঐচ্ছিক)</label>
-                          <div className="relative group">
-                            <div className="absolute left-6 top-7 text-slate-400 group-focus-within:text-slate-900 transition-colors">
-                              <MapPin size={20} />
+                        {/* Section 2: Account Info */}
+                        <div className="space-y-8">
+                          <div className="bg-white p-10 rounded-[3.5rem] shadow-2xl shadow-slate-100 border border-slate-100 space-y-8 relative overflow-hidden h-full">
+                            <div className="absolute bottom-0 left-0 w-32 h-32 bg-indigo-50/50 rounded-full -ml-16 -mb-16 z-0" />
+                            
+                            <div className="relative z-10">
+                              <div className="flex items-center space-x-3 mb-8">
+                                <div className="w-8 h-8 bg-orange-100 text-orange-600 rounded-xl flex items-center justify-center">
+                                  <Wallet size={16} />
+                                </div>
+                                <h3 className="text-xs font-black text-slate-900 uppercase tracking-widest">হিসাব ও মেয়াদ</h3>
+                              </div>
+
+                              <div className="space-y-8">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                                  <div className="space-y-3">
+                                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">শুরুর তারিখ</label>
+                                    <div className="relative group">
+                                      <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
+                                        <Calendar size={20} />
+                                      </div>
+                                      <input
+                                        required
+                                        type="date"
+                                        value={newCustomer.startDate}
+                                        onChange={e => setNewCustomer({ ...newCustomer, startDate: e.target.value })}
+                                        className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
+                                      />
+                                    </div>
+                                  </div>
+                                  <div className="space-y-3">
+                                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">মেয়াদ (মাস)</label>
+                                    <div className="relative group">
+                                      <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
+                                        <Calendar size={20} />
+                                      </div>
+                                      <input
+                                        required
+                                        type="number"
+                                        min="1"
+                                        value={newCustomer.validityMonths}
+                                        onChange={e => setNewCustomer({ ...newCustomer, validityMonths: parseInt(e.target.value) || 1 })}
+                                        className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
+                                      />
+                                    </div>
+                                  </div>
+                                </div>
+
+                                <div className="p-6 bg-indigo-50 rounded-3xl border border-indigo-100 flex items-center justify-between shadow-inner">
+                                  <div>
+                                    <p className="text-[10px] text-indigo-600 font-black uppercase tracking-widest mb-1">মেয়াদ শেষ হবে</p>
+                                    <p className="text-lg font-black text-indigo-900">
+                                      {format(addMonths(new Date(newCustomer.startDate), newCustomer.validityMonths), 'dd MMM, yyyy', { locale: bn })}
+                                    </p>
+                                  </div>
+                                  <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center text-indigo-600 shadow-sm">
+                                    <CheckCircle2 size={20} />
+                                  </div>
+                                </div>
+
+                                <div className="space-y-3">
+                                  <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">বকেয়া পরিমাণ (৳)</label>
+                                  <div className="relative group">
+                                    <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors font-bold text-xl">
+                                      ৳
+                                    </div>
+                                    <input
+                                      type="number"
+                                      value={newCustomer.balance}
+                                      onChange={e => setNewCustomer({ ...newCustomer, balance: parseInt(e.target.value) || 0 })}
+                                      className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
+                                    />
+                                  </div>
+                                </div>
+
+                                <div className="pt-4">
+                                  <button
+                                    type="submit"
+                                    disabled={isSubmitting}
+                                    className="w-full bg-slate-900 text-white py-7 rounded-[2.5rem] font-black text-xs uppercase tracking-[0.3em] hover:bg-slate-800 shadow-2xl shadow-slate-200 transition-all duration-500 flex items-center justify-center space-x-4 disabled:opacity-50 group active:scale-[0.98]"
+                                  >
+                                    <UserPlus size={20} className="group-hover:scale-110 transition-transform" />
+                                    <span>নথিভুক্ত করুন</span>
+                                  </button>
+                                </div>
+                              </div>
                             </div>
-                            <textarea
-                              value={newCustomer.address}
-                              onChange={e => setNewCustomer({ ...newCustomer, address: e.target.value })}
-                              className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 placeholder:text-slate-300 placeholder:font-medium min-h-[140px] text-lg"
-                              placeholder="গ্রাম, পোস্ট, উপজেলা..."
-                            />
                           </div>
                         </div>
-
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-                          <div className="space-y-3">
-                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">প্রাথমিক মেয়াদ (মাস)</label>
-                            <div className="relative group">
-                              <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
-                                <Calendar size={20} />
-                              </div>
-                              <input
-                                required
-                                type="number"
-                                min="1"
-                                value={newCustomer.validityMonths}
-                                onChange={e => setNewCustomer({ ...newCustomer, validityMonths: parseInt(e.target.value) })}
-                                className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
-                              />
-                            </div>
-                          </div>
-                          <div className="space-y-3">
-                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">বকেয়া পরিমাণ (৳)</label>
-                            <div className="relative group">
-                              <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors font-bold text-xl">
-                                ৳
-                              </div>
-                              <input
-                                type="number"
-                                value={newCustomer.balance}
-                                onChange={e => setNewCustomer({ ...newCustomer, balance: parseInt(e.target.value) })}
-                                className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
-                              />
-                            </div>
-                          </div>
-                        </div>
-
-                        <button
-                          type="submit"
-                          disabled={isSubmitting}
-                          className="w-full bg-slate-900 text-white py-7 rounded-[2.5rem] font-black text-sm uppercase tracking-[0.3em] hover:bg-slate-800 shadow-2xl shadow-slate-200 transition-all duration-500 flex items-center justify-center space-x-4 disabled:opacity-50 group active:scale-[0.98]"
-                        >
-                          <UserPlus size={24} className="group-hover:scale-110 transition-transform" />
-                          <span>গ্রাহক নথিভুক্ত করুন</span>
-                        </button>
                       </div>
                     </form>
                   </div>
@@ -954,34 +1362,34 @@ export default function App() {
 
               {activeTab === 'reports' && (
                 <motion.div key="reports" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                  <div className="mb-8">
-                    <h2 className="text-3xl font-bold text-gray-900 mb-2">রিপোর্ট জেনারেট করুন</h2>
-                    <p className="text-gray-500">নির্দিষ্ট সময়ের কালেকশন রিপোর্ট দেখুন।</p>
+                  <div className="mb-10">
+                    <h2 className="text-3xl font-bold text-slate-900 mb-2">রিপোর্ট জেনারেট করুন</h2>
+                    <p className="text-slate-500">নির্দিষ্ট সময়ের কালেকশন রিপোর্ট দেখুন।</p>
                   </div>
 
-                  <div className="bg-white p-8 rounded-3xl shadow-sm border border-gray-100 mb-8">
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-end">
-                      <div className="space-y-2">
-                        <label className="text-sm font-semibold text-gray-700">শুরুর তারিখ</label>
+                  <div className="bg-white p-10 rounded-[2.5rem] shadow-sm border border-slate-200/60 mb-10">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-8 items-end">
+                      <div className="space-y-3">
+                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">শুরুর তারিখ</label>
                         <input
                           type="date"
                           value={reportRange.start}
                           onChange={e => setReportRange({ ...reportRange, start: e.target.value })}
-                          className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:border-blue-500 outline-none"
+                          className="w-full px-6 py-4 rounded-2xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900"
                         />
                       </div>
-                      <div className="space-y-2">
-                        <label className="text-sm font-semibold text-gray-700">শেষ তারিখ</label>
+                      <div className="space-y-3">
+                        <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">শেষ তারিখ</label>
                         <input
                           type="date"
                           value={reportRange.end}
                           onChange={e => setReportRange({ ...reportRange, end: e.target.value })}
-                          className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:border-blue-500 outline-none"
+                          className="w-full px-6 py-4 rounded-2xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900"
                         />
                       </div>
                       <button
                         onClick={() => window.print()}
-                        className="bg-slate-900 text-white py-3 rounded-xl font-bold text-xs uppercase tracking-widest hover:bg-slate-800 transition-all flex items-center justify-center space-x-2 shadow-lg shadow-slate-200"
+                        className="bg-slate-900 text-white py-5 rounded-2xl font-black text-xs uppercase tracking-[0.3em] hover:bg-slate-800 transition-all flex items-center justify-center space-x-3 shadow-xl shadow-slate-200 active:scale-[0.98]"
                       >
                         <Printer size={18} />
                         <span>প্রিন্ট করুন</span>
@@ -989,41 +1397,41 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div id="printable-report" className="bg-white rounded-3xl shadow-sm border border-gray-100 overflow-hidden">
-                    <div className="p-8 border-b border-gray-100 flex justify-between items-center">
+                  <div id="printable-report" className="bg-white rounded-[2.5rem] shadow-sm border border-slate-200/60 overflow-hidden">
+                    <div className="p-10 border-b border-slate-100 flex justify-between items-center bg-slate-50/50">
                       <div>
-                        <h3 className="text-2xl font-bold text-gray-900">কালেকশন রিপোর্ট</h3>
-                        <p className="text-gray-500">
+                        <h3 className="text-2xl font-bold text-slate-900">কালেকশন রিপোর্ট</h3>
+                        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">
                           {format(new Date(reportRange.start), 'dd MMM, yyyy', { locale: bn })} থেকে {format(new Date(reportRange.end), 'dd MMM, yyyy', { locale: bn })}
                         </p>
                       </div>
                       <div className="text-right">
-                        <p className="text-sm text-gray-500 uppercase font-bold">মোট কালেকশন</p>
-                        <p className="text-3xl font-bold text-green-600">
+                        <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest mb-1">মোট কালেকশন</p>
+                        <p className="text-3xl font-black text-emerald-600">
                           {reportData.reduce((sum, c) => sum + c.amount, 0)} ৳
                         </p>
                       </div>
                     </div>
                     <div className="overflow-x-auto">
                       <table className="w-full text-left">
-                        <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wider">
+                        <thead className="bg-slate-50/50 text-slate-400 text-[10px] uppercase tracking-widest border-b border-slate-100">
                           <tr>
-                            <th className="px-6 py-4 font-semibold">তারিখ</th>
-                            <th className="px-6 py-4 font-semibold">গ্রাহক</th>
-                            <th className="px-6 py-4 font-semibold">পরিমাণ</th>
+                            <th className="px-10 py-5 font-bold">তারিখ</th>
+                            <th className="px-10 py-5 font-bold">গ্রাহক</th>
+                            <th className="px-10 py-5 font-bold text-right">পরিমাণ</th>
                           </tr>
                         </thead>
-                        <tbody className="divide-y divide-gray-100">
+                        <tbody className="divide-y divide-slate-100">
                           {reportData.map(record => (
-                            <tr key={record.id}>
-                              <td className="px-6 py-4 text-gray-600">{format(record.date.toDate(), 'dd MMM, yyyy', { locale: bn })}</td>
-                              <td className="px-6 py-4 font-medium text-gray-900">{record.customerName}</td>
-                              <td className="px-6 py-4 font-bold text-green-600">{record.amount} ৳</td>
+                            <tr key={record.id} className="hover:bg-slate-50/50 transition-colors">
+                              <td className="px-10 py-6 text-sm text-slate-600 font-medium">{format(record.date.toDate(), 'dd MMM, yyyy', { locale: bn })}</td>
+                              <td className="px-10 py-6 font-bold text-slate-900">{record.customerName}</td>
+                              <td className="px-10 py-6 font-black text-emerald-600 text-right">{record.amount} ৳</td>
                             </tr>
                           ))}
                           {reportData.length === 0 && (
                             <tr>
-                              <td colSpan={3} className="px-6 py-10 text-center text-gray-500">এই সময়ে কোনো কালেকশন পাওয়া যায়নি।</td>
+                              <td colSpan={3} className="px-10 py-20 text-center text-slate-400 font-bold italic">এই সময়ে কোনো কালেকশন পাওয়া যায়নি।</td>
                             </tr>
                           )}
                         </tbody>
@@ -1195,48 +1603,64 @@ export default function App() {
                 <form onSubmit={handleUpdateCustomer} className="p-10 space-y-8">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                     <div className="space-y-3">
-                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">নাম</label>
-                      <input
-                        required
-                        type="text"
-                        value={selectedCustomer.name}
-                        onChange={e => setSelectedCustomer({ ...selectedCustomer, name: e.target.value })}
-                        className="w-full px-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
-                        placeholder="গ্রাহকের নাম"
-                      />
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">গ্রাহকের নাম</label>
+                      <div className="relative group">
+                        <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
+                          <Users size={18} />
+                        </div>
+                        <input
+                          required
+                          type="text"
+                          value={selectedCustomer.name}
+                          onChange={e => setSelectedCustomer({ ...selectedCustomer, name: e.target.value })}
+                          className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
+                          placeholder="গ্রাহকের নাম"
+                        />
+                      </div>
                     </div>
                     <div className="space-y-3">
-                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">ফোন</label>
-                      <input
-                        required
-                        type="tel"
-                        value={selectedCustomer.phone}
-                        onChange={e => setSelectedCustomer({ ...selectedCustomer, phone: e.target.value })}
-                        className="w-full px-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
-                        placeholder="ফোন নম্বর"
-                      />
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">ফোন নম্বর</label>
+                      <div className="relative group">
+                        <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
+                          <Phone size={18} />
+                        </div>
+                        <input
+                          required
+                          type="tel"
+                          value={selectedCustomer.phone}
+                          onChange={e => setSelectedCustomer({ ...selectedCustomer, phone: e.target.value })}
+                          className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
+                          placeholder="ফোন নম্বর"
+                        />
+                      </div>
                     </div>
                   </div>
 
                   <div className="space-y-3">
                     <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">ঠিকানা</label>
-                    <textarea
-                      value={selectedCustomer.address}
-                      onChange={e => setSelectedCustomer({ ...selectedCustomer, address: e.target.value })}
-                      className="w-full px-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 min-h-[140px] text-lg"
-                      placeholder="গ্রাহকের ঠিকানা"
-                    />
+                    <div className="relative group">
+                      <div className="absolute left-6 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-slate-900 transition-colors">
+                        <MapPin size={18} />
+                      </div>
+                      <input
+                        type="text"
+                        value={selectedCustomer.address}
+                        onChange={e => setSelectedCustomer({ ...selectedCustomer, address: e.target.value })}
+                        className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-lg"
+                        placeholder="গ্রাহকের ঠিকানা"
+                      />
+                    </div>
                   </div>
 
                   <div className="space-y-3">
-                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">বকেয়া (৳)</label>
+                    <label className="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em] ml-1">বকেয়া পরিমাণ (৳)</label>
                     <div className="relative group">
                       <span className="absolute left-8 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-xl group-focus-within:text-slate-900 transition-colors">৳</span>
                       <input
                         type="number"
                         value={selectedCustomer.balance}
                         onChange={e => setSelectedCustomer({ ...selectedCustomer, balance: parseInt(e.target.value) || 0 })}
-                        className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-mono font-bold text-slate-900 text-2xl"
+                        className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-2xl"
                       />
                     </div>
                   </div>
@@ -1244,7 +1668,7 @@ export default function App() {
                   <div className="pt-8 flex space-x-6">
                     <button 
                       type="button"
-                      onClick={() => setIsEditModalOpen(false)}
+                      onClick={() => { setIsEditModalOpen(false); setSelectedCustomer(null); }}
                       className="flex-1 px-10 py-6 rounded-3xl font-bold text-[10px] uppercase tracking-[0.2em] text-slate-400 hover:text-slate-900 hover:bg-slate-50 transition-all"
                     >
                       বাতিল করুন
@@ -1339,7 +1763,7 @@ export default function App() {
                             autoFocus
                             value={collectionForm.amount}
                             onChange={e => setCollectionForm({ ...collectionForm, amount: parseInt(e.target.value) })}
-                            className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-mono font-bold text-slate-900 text-2xl"
+                            className="w-full pl-16 pr-8 py-5 rounded-3xl border-2 border-slate-50 bg-slate-50/50 focus:bg-white focus:border-slate-900 outline-none transition-all font-bold text-slate-900 text-2xl"
                           />
                         </div>
                       </div>
@@ -1361,14 +1785,14 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="p-8 bg-emerald-50 rounded-[2.5rem] border border-emerald-100 flex items-center justify-between shadow-inner">
+                    <div className="p-8 bg-indigo-50 rounded-[2.5rem] border border-indigo-100 flex items-center justify-between shadow-inner">
                       <div>
-                        <p className="text-[10px] text-emerald-600 font-black uppercase tracking-widest mb-1">নতুন মেয়াদ হবে</p>
-                        <p className="text-xl font-black text-emerald-900">
+                        <p className="text-[10px] text-indigo-600 font-black uppercase tracking-widest mb-1">নতুন মেয়াদ হবে</p>
+                        <p className="text-xl font-black text-indigo-900">
                           {format(addMonths(isAfter(new Date(), selectedCustomer.validityDate.toDate()) ? new Date() : selectedCustomer.validityDate.toDate(), collectionForm.monthsToAdd), 'dd MMM, yyyy', { locale: bn })}
                         </p>
                       </div>
-                      <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center text-emerald-600 shadow-sm">
+                      <div className="w-12 h-12 bg-white rounded-2xl flex items-center justify-center text-indigo-600 shadow-sm">
                         <CheckCircle2 size={24} />
                       </div>
                     </div>

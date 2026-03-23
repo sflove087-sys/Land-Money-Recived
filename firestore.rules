@@ -79,17 +79,17 @@ service cloud.firestore {
              data.createdAt is timestamp;
     }
 
-    function isValidCustomer(data) {
+    function isValidCustomer(data, isUpdate) {
       return hasOnlyAllowedFields(['name', 'phone', 'address', 'validityDate', 'balance', 'status', 'createdBy', 'createdAt']) &&
              data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
              data.phone is string && data.phone.size() > 0 && data.phone.size() < 20 &&
              data.validityDate is timestamp &&
              data.status in ['active', 'expired'] &&
-             data.createdBy == request.auth.uid &&
+             (isUpdate ? data.createdBy == resource.data.createdBy : data.createdBy == request.auth.uid) &&
              data.createdAt is timestamp;
     }
 
-    function isValidCollection(data) {
+    function isValidCollection(data, isUpdate) {
       return hasOnlyAllowedFields(['customerId', 'customerName', 'amount', 'date', 'previousValidity', 'newValidity', 'collectedBy']) &&
              data.customerId is string &&
              data.customerName is string &&
@@ -97,7 +97,7 @@ service cloud.firestore {
              data.date is timestamp &&
              data.previousValidity is timestamp &&
              data.newValidity is timestamp &&
-             data.collectedBy == request.auth.uid;
+             (isUpdate ? data.collectedBy == resource.data.collectedBy : data.collectedBy == request.auth.uid);
     }
 
     // ===============================================================
@@ -114,16 +114,16 @@ service cloud.firestore {
     }
 
     match /customers/{customerId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated() && isValidCustomer(request.resource.data);
-      allow update: if isAuthenticated() && isValidCustomer(request.resource.data);
+      allow read: if isAuthenticated() && (resource.data.createdBy == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidCustomer(request.resource.data, false);
+      allow update: if isAuthenticated() && (resource.data.createdBy == request.auth.uid || isAdmin()) && isValidCustomer(request.resource.data, true);
       allow delete: if isAdmin();
     }
 
     match /collections/{collectionId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated() && isValidCollection(request.resource.data);
-      allow update: if isAdmin(); // Only admins can correct collection records
+      allow read: if isAuthenticated() && (resource.data.collectedBy == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidCollection(request.resource.data, false);
+      allow update: if isAdmin() && isValidCollection(request.resource.data, true); // Only admins can correct collection records
       allow delete: if isAdmin();
     }
   }
